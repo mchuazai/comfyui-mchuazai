@@ -12,4 +12,4 @@
 *   **中英双语**：自动识别系统语言。
 *   支持debian
 *   
-一键部署命令 curl -fsSL https://raw.githubusercontent.com/mchuazai/comfyui-mchuazai/main/comfyui-install.sh -o comfyui-install.sh && sudo bash comfyui-install.sh
+一键部署命令 curl -fsSL https://raw.githubusercontent.com/mchuazai/comfyui-mchuazai/main/install.sh -o install.sh && sudo bash install.sh
