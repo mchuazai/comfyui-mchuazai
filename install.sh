@@ -1,12 +1,10 @@
-from pathlib import Path
-
-script = r'''#!/usr/bin/env bash
-# ComfyUI Universal Installer V2.1.2
+#!/usr/bin/env bash
+# ComfyUI Universal Installer V2.1.5
 # Linux x86_64 / AMD64 only
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.2"
+VERSION="2.1.6"
 IMAGE_REPO="yanwk/comfyui-boot"
 CONTAINER="comfyui"
 DATA_DIR=""
@@ -17,6 +15,10 @@ PORT="8188"
 OLD_CONTAINER=""
 LANG_CODE="en"
 BACKUP_DIR=""
+DATA_DIR_CREATED=false
+OLD_WAS_RUNNING=false
+NEW_CONTAINER_CREATED=false
+ASK_OPTION_RESULT=""
 
 RED=$'\033[31m'
 GREEN=$'\033[32m'
@@ -42,17 +44,20 @@ detect_language() {
     [[ "$locale" == zh* ]] && LANG_CODE="zh" || LANG_CODE="en"
 }
 
-# 从终端读取一行；非交互环境（stdin 不可读）时直接失败，避免静默使用默认值。
+# 从终端读取一行，结果写入调用者指定的变量（$2）。
+# 必须以“直接调用”方式使用，不要放在命令替换里，否则 die 会在子 shell 中失效。
+# 函数内不能声明与 $2 同名的 local 变量，否则 printf -v 会写入本地变量。
 read_input() {
     local prompt="$1"
-    local answer
+    local __outvar="$2"
+    local __value
 
-    if ! read -r -p "$prompt" answer; then
+    if ! read -r -p "$prompt" __value; then
         die "$(msg "无法从终端读取输入，请以交互方式运行本脚本。" \
                     "Cannot read input from the terminal. Run this installer interactively.")"
     fi
 
-    printf '%s' "$answer"
+    printf -v "$__outvar" '%s' "$__value"
 }
 
 ask_yes_no() {
@@ -62,10 +67,10 @@ ask_yes_no() {
 
     while true; do
         if [[ "$default" == "y" ]]; then
-            answer="$(read_input "$prompt [Y/n]: ")"
+            read_input "$prompt [Y/n]: " answer
             answer="${answer:-y}"
         else
-            answer="$(read_input "$prompt [y/N]: ")"
+            read_input "$prompt [y/N]: " answer
             answer="${answer:-n}"
         fi
 
@@ -77,6 +82,7 @@ ask_yes_no() {
     done
 }
 
+# 结果写入全局 ASK_OPTION_RESULT，避免命令替换导致 die 在子 shell 中失效。
 ask_option() {
     local prompt="$1"
     local default="$2"
@@ -86,12 +92,12 @@ ask_option() {
     local valid
 
     while true; do
-        answer="$(read_input "$prompt [$default]: ")"
+        read_input "$prompt [$default]: " answer
         answer="${answer:-$default}"
 
         for valid in "$@"; do
             if [[ "$answer" == "$valid" ]]; then
-                printf '%s' "$answer"
+                ASK_OPTION_RESULT="$answer"
                 return 0
             fi
         done
@@ -140,9 +146,9 @@ check_commands() {
     local command_name
 
     for command_name in \
-        curl awk grep sed df findmnt ss head getent \
+        curl awk df findmnt ss head getent realpath \
         hostname date mktemp mkdir dirname find \
-        lsblk sleep seq chmod
+        lsblk sleep seq chmod rm id chown ln
     do
         command -v "$command_name" >/dev/null 2>&1 ||
             die "$(msg "缺少必需命令：" "Missing required command:") $command_name"
@@ -166,20 +172,58 @@ show_system_info() {
     echo
 }
 
+# 规范化并校验数据目录，结果写入 $2。
+# 拒绝：空路径、控制字符、.. 组件、规范化后为 /、系统关键路径。
+# 符号链接会被 realpath -m 解析，因此 link -> /etc 这类路径会被拒绝。
+normalize_data_path() {
+    local raw="$1"
+    local __outvar="$2"
+    local normalized
+
+    [[ -n "$raw" ]] ||
+        die "$(msg "数据目录不能为空。" "Data directory cannot be empty.")"
+
+    [[ "$raw" == /* ]] ||
+        die "$(msg "数据目录必须使用绝对路径。" "Data directory must be an absolute path.")"
+
+    if [[ "$raw" == *[$'\n\t\r']* ]]; then
+        die "$(msg "数据目录不能包含换行、制表符或回车。" \
+                    "Data directory cannot contain newline, tab or carriage return.")"
+    fi
+
+    if [[ "/$raw/" == */../* ]]; then
+        die "$(msg "数据目录不能包含 .. 组件。" \
+                    "Data directory cannot contain .. components.")"
+    fi
+
+    normalized="$(realpath -m -- "$raw" 2>/dev/null)" ||
+        die "$(msg "无法规范化数据目录路径。" \
+                    "Could not normalize the data directory path.")"
+
+    [[ -n "$normalized" ]] ||
+        die "$(msg "无法规范化数据目录路径。" \
+                    "Could not normalize the data directory path.")"
+
+    [[ "$normalized" != "/" ]] ||
+        die "$(msg "不能将 / 设置为数据目录。" \
+                    "The root directory cannot be used as the data directory.")"
+
+    case "$normalized" in
+        /etc|/etc/*|/usr|/usr/*|/var|/var/*|/boot|/boot/*|/dev|/dev/*|/proc|/proc/*|/sys|/sys/*|/run|/run/*)
+            die "$(msg "数据目录不能位于系统关键路径下：$normalized" \
+                        "Data directory cannot be under a system-critical path: $normalized")"
+            ;;
+    esac
+
+    printf -v "$__outvar" '%s' "$normalized"
+}
+
 validate_data_path() {
     local path="$1"
     local parent
     local mount_target
     local available_kb
     local mount_source
-
-    [[ "$path" == /* ]] ||
-        die "$(msg "数据目录必须使用绝对路径。" \
-                    "Data directory must be an absolute path.")"
-
-    [[ "$path" != "/" ]] ||
-        die "$(msg "不能将 / 设置为数据目录。" \
-                    "The root directory cannot be used as the data directory.")"
 
     # 在创建任何目录前，先解析最近的已存在祖先目录。
     parent="$path"
@@ -209,7 +253,12 @@ validate_data_path() {
             die "$(msg "已取消安装。" "Installation cancelled.")"
     fi
 
-    mkdir -p "$path"
+    if [[ ! -e "$path" ]]; then
+        DATA_DIR_CREATED=true
+    fi
+
+    mkdir -p "$path" ||
+        die "$(msg "无法创建数据目录。" "Could not create the data directory.")"
 
     [[ -d "$path" && -w "$path" ]] ||
         die "$(msg "数据目录不可写。" "Data directory is not writable.")"
@@ -234,6 +283,7 @@ validate_data_path() {
 choose_data_directory() {
     local default_path="${HOME}/ComfyUI-Docker"
     local answer
+    local candidate
 
     # 通过 sudo 调用时，优先使用调用者的家目录。
     if [[ -n "${SUDO_USER:-}" ]] && command -v getent >/dev/null 2>&1; then
@@ -248,10 +298,10 @@ choose_data_directory() {
     echo "$(msg "建议使用已经挂载好的独立数据盘。" \
                   "A mounted data disk is recommended.")"
 
-    answer="$(read_input "[$default_path]: ")"
-    DATA_DIR="${answer:-$default_path}"
+    read_input "[$default_path]: " answer
+    candidate="${answer:-$default_path}"
 
-    validate_data_path "$DATA_DIR"
+    normalize_data_path "$candidate" DATA_DIR
 }
 
 check_docker() {
@@ -295,7 +345,8 @@ check_docker() {
     local temp_script
     temp_script="$(mktemp)"
 
-    if ! curl -fL --retry 2 --connect-timeout 15 \
+    if ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 2 --connect-timeout 15 \
         https://get.docker.com -o "$temp_script"; then
         rm -f "$temp_script"
         die "$(msg "Docker 安装脚本下载失败。" \
@@ -326,6 +377,65 @@ check_docker() {
     ok "$(msg "Docker 安装完成。" "Docker installation completed.")"
 }
 
+# Docker 镜像通常存储在 DockerRootDir（常在 /var/lib/docker），
+# 可能与 DATA_DIR 不在同一分区，因此单独检查其可用空间。
+check_docker_space() {
+    local docker_root
+    local available_kb
+    local required_kb=$((15 * 1024 * 1024))  # 15 GiB，保守估计
+
+    docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+
+    if [[ -z "$docker_root" || ! -d "$docker_root" ]]; then
+        warn "$(msg "无法确定 Docker 存储目录，跳过 Docker 空间检查。" \
+                     "Could not determine the Docker storage directory. Skipping Docker space check.")"
+        return 0
+    fi
+
+    available_kb="$(df -Pk "$docker_root" 2>/dev/null | awk 'NR==2 {print $4}')"
+
+    if [[ ! "$available_kb" =~ ^[0-9]+$ ]]; then
+        warn "$(msg "无法确定 Docker 存储目录的可用空间，跳过检查。" \
+                     "Could not determine free space under the Docker storage directory. Skipping check.")"
+        return 0
+    fi
+
+    info "$(msg "Docker 存储目录：" "Docker storage directory:") $docker_root"
+    info "$(msg "Docker 存储可用空间：约" "Docker storage free space: about") $(( available_kb / 1024 / 1024 )) GiB"
+
+    if (( available_kb < required_kb )); then
+        warn "$(msg "Docker 存储可用空间不足 15 GiB，镜像拉取可能失败。" \
+                     "Less than 15 GiB is available under the Docker storage directory. Image pull may fail.")"
+        ask_yes_no \
+            "$(msg "仍然继续？" "Continue anyway?")" \
+            n ||
+            die "$(msg "已取消安装。" "Installation cancelled.")"
+    fi
+}
+
+# 防止把 ComfyUI 数据目录放进 Docker 自身存储目录，或反过来覆盖 Docker 存储目录。
+check_data_docker_path_conflict() {
+    local docker_root
+    local normalized_root
+
+    docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+    if [[ -z "$docker_root" || "$docker_root" != /* ]]; then
+        warn "$(msg "无法可靠识别 Docker 存储目录，跳过路径冲突检查。" \
+                     "Could not reliably identify Docker storage path; skipping overlap check.")"
+        return 0
+    fi
+
+    normalized_root="$(realpath -m -- "$docker_root" 2>/dev/null)" ||
+        die "$(msg "无法规范化 Docker 存储目录。" "Could not normalize Docker storage directory.")"
+
+    if [[ "$DATA_DIR" == "$normalized_root" ||
+          "$DATA_DIR/" == "$normalized_root/"* ||
+          "$normalized_root/" == "$DATA_DIR/"* ]]; then
+        die "$(msg "ComfyUI 数据目录与 Docker 存储目录存在重叠：$DATA_DIR 与 $normalized_root。请更换数据目录。" \
+                    "ComfyUI data directory overlaps Docker storage: $DATA_DIR and $normalized_root. Choose another data directory.")"
+    fi
+}
+
 detect_nvidia() {
     command -v nvidia-smi >/dev/null 2>&1 &&
         nvidia-smi -L >/dev/null 2>&1
@@ -352,7 +462,8 @@ choose_image() {
         echo "   CPU only"
         echo
 
-        choice="$(ask_option "$(msg "选择镜像" "Select image")" 1 1 2 3)"
+        ask_option "$(msg "选择镜像" "Select image")" 1 1 2 3
+        choice="$ASK_OPTION_RESULT"
 
         case "$choice" in
             1)
@@ -415,7 +526,8 @@ choose_access_mode() {
     echo "1) $(msg "仅本机访问" "Local access only")"
     echo "2) $(msg "局域网访问" "LAN access")"
 
-    choice="$(ask_option "$(msg "选择" "Select")" 1 1 2)"
+    ask_option "$(msg "选择" "Select")" 1 1 2
+    choice="$ASK_OPTION_RESULT"
 
     if [[ "$choice" == "1" ]]; then
         BIND_ADDR="127.0.0.1"
@@ -423,7 +535,7 @@ choose_access_mode() {
         BIND_ADDR="0.0.0.0"
     fi
 
-    answer="$(read_input "$(msg "端口" "Port") [8188]: ")"
+    read_input "$(msg "端口" "Port") [8188]: " answer
     answer="${answer:-8188}"
 
     [[ "$answer" =~ ^[0-9]{1,5}$ ]] ||
@@ -448,7 +560,39 @@ choose_access_mode() {
 prepare_data_directories() {
     BACKUP_DIR="$DATA_DIR/backups"
 
-    mkdir -p \
+    # 先记录哪些目录是本次新建的，之后只对这些目录做非递归 chown。
+    local -a new_dirs=()
+    local dir
+    local backup_dir_created=false
+
+    for dir in \
+        "$DATA_DIR/storage-cache" \
+        "$DATA_DIR/storage-cache/dot-cache" \
+        "$DATA_DIR/storage-cache/dot-config" \
+        "$DATA_DIR/storage-nodes" \
+        "$DATA_DIR/storage-nodes/dot-local" \
+        "$DATA_DIR/storage-nodes/custom_nodes" \
+        "$DATA_DIR/storage-models" \
+        "$DATA_DIR/storage-models/models" \
+        "$DATA_DIR/storage-models/hf-hub" \
+        "$DATA_DIR/storage-models/torch-hub" \
+        "$DATA_DIR/storage-user" \
+        "$DATA_DIR/storage-user/input" \
+        "$DATA_DIR/storage-user/output" \
+        "$DATA_DIR/storage-user/user-profile" \
+        "$DATA_DIR/storage-user/user-scripts" \
+        "$BACKUP_DIR"
+    do
+        if [[ -e "$dir" ]]; then
+            [[ -d "$dir" ]] ||
+                die "$(msg "预期目录位置已存在非目录文件：$dir" "A non-directory file exists where a directory is required: $dir")"
+        else
+            new_dirs+=("$dir")
+            [[ "$dir" == "$BACKUP_DIR" ]] && backup_dir_created=true
+        fi
+    done
+
+    if ! mkdir -p \
         "$DATA_DIR/storage-cache/dot-cache" \
         "$DATA_DIR/storage-cache/dot-config" \
         "$DATA_DIR/storage-nodes/dot-local" \
@@ -460,16 +604,27 @@ prepare_data_directories() {
         "$DATA_DIR/storage-user/output" \
         "$DATA_DIR/storage-user/user-profile" \
         "$DATA_DIR/storage-user/user-scripts" \
-        "$BACKUP_DIR"
+        "$BACKUP_DIR"; then
+        die "$(msg "无法创建 ComfyUI 数据子目录。" "Could not create ComfyUI data subdirectories.")"
+    fi
 
     [[ -d "$BACKUP_DIR" && -w "$BACKUP_DIR" ]] ||
         die "$(msg "备份目录不可写。" "Backup directory is not writable.")"
 
-    # 通过 sudo 运行时，把数据目录交还给调用者，便于其后续管理文件。
+    # 仅对本次新建的备份目录设置权限，不修改用户已有目录的权限。
+    if [[ "$backup_dir_created" == true ]]; then
+        chmod 700 "$BACKUP_DIR" ||
+            warn "$(msg "无法将新建备份目录权限设为 700。" "Could not set new backup directory permissions to 700.")"
+    fi
+
+    # 只把本次新建的目录交还给调用者；绝不递归修改已有文件。
     if [[ -n "${SUDO_USER:-}" ]] && id -u "$SUDO_USER" >/dev/null 2>&1; then
-        chown -R "$SUDO_USER:" "$DATA_DIR" 2>/dev/null ||
-            warn "$(msg "无法将数据目录所有者改为 ${SUDO_USER}，后续可能需要 sudo 才能管理文件。" \
-                         "Could not change the data directory owner to ${SUDO_USER}. sudo may be required to manage files.")"
+        if [[ "$DATA_DIR_CREATED" == true ]]; then
+            chown --from=root "$SUDO_USER:" "$DATA_DIR" 2>/dev/null || true
+        fi
+        for dir in "${new_dirs[@]}"; do
+            chown --from=root "$SUDO_USER:" "$dir" 2>/dev/null || true
+        done
     fi
 }
 
@@ -494,36 +649,79 @@ pull_image() {
                 "Image pull failed. Check network, Docker Hub rate limits and registry mirror settings.")"
 }
 
+# 保存 docker inspect 输出，文件权限 600（可能含 Config.Env 等敏感信息）。
+save_container_inspect() {
+    local container="$1"
+    local outfile="$2"
+    local tmpfile
+
+    [[ ! -e "$outfile" ]] || return 1
+
+    tmpfile="$(mktemp "${outfile}.XXXXXX")" || return 1
+    chmod 600 "$tmpfile" 2>/dev/null || true
+
+    if ! docker inspect "$container" > "$tmpfile" 2>/dev/null; then
+        rm -f "$tmpfile"
+        return 1
+    fi
+
+    # 同目录硬链接发布是原子的，且目标已存在时不会覆盖旧备份。
+    if ! ln -- "$tmpfile" "$outfile" 2>/dev/null; then
+        rm -f "$tmpfile"
+        return 1
+    fi
+
+    rm -f "$tmpfile"
+    chmod 600 "$outfile" 2>/dev/null || true
+    return 0
+}
+
 backup_existing_container() {
+    local base_name
+    local suffix=0
+    local state
+
     if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
         return 0
     fi
 
-    OLD_CONTAINER="${CONTAINER}-backup-$(date +%Y%m%d-%H%M%S)"
+    state="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" ||
+        die "$(msg "无法读取旧容器运行状态，已取消替换。" "Could not read old container state; replacement aborted.")"
+
+    [[ "$state" == "true" ]] && OLD_WAS_RUNNING=true || OLD_WAS_RUNNING=false
+
+    base_name="${CONTAINER}-backup-$(date +%Y%m%d-%H%M%S)"
+    OLD_CONTAINER="$base_name"
     BACKUP_DIR="$DATA_DIR/backups"
 
-    # 避免与更早的备份容器名冲突。
-    if docker container inspect "$OLD_CONTAINER" >/dev/null 2>&1; then
-        OLD_CONTAINER="${OLD_CONTAINER}-$$"
-    fi
+    # 同时避开已有容器名和已有 JSON 文件，绝不覆盖旧备份。
+    while docker container inspect "$OLD_CONTAINER" >/dev/null 2>&1 ||
+          [[ -e "$BACKUP_DIR/${OLD_CONTAINER}.json" ]]; do
+        suffix=$((suffix + 1))
+        OLD_CONTAINER="${base_name}-${suffix}"
+    done
 
     warn "$(msg "发现同名容器，准备保留旧容器：" \
                  "Existing container found. It will be preserved as:") $OLD_CONTAINER"
 
-    docker inspect "$CONTAINER" \
-        > "$BACKUP_DIR/${OLD_CONTAINER}.json" ||
+    if ! save_container_inspect "$CONTAINER" "$BACKUP_DIR/${OLD_CONTAINER}.json"; then
         die "$(msg "无法保存旧容器配置，已停止替换。" \
                     "Could not save the old container configuration. Replacement aborted.")"
+    fi
 
-    if ! docker stop -t 30 "$CONTAINER" >/dev/null; then
-        die "$(msg "无法停止旧容器，已取消替换。" \
-                    "Could not stop the old container. Replacement aborted.")"
+    if [[ "$OLD_WAS_RUNNING" == true ]]; then
+        if ! docker stop -t 30 "$CONTAINER" >/dev/null; then
+            die "$(msg "无法停止旧容器，已取消替换。" \
+                        "Could not stop the old container. Replacement aborted.")"
+        fi
     fi
 
     if ! docker rename "$CONTAINER" "$OLD_CONTAINER"; then
-        docker start "$CONTAINER" >/dev/null 2>&1 || true
-        die "$(msg "无法重命名旧容器，已尝试重新启动旧容器。" \
-                    "Could not rename the old container. Attempted to restart it.")"
+        if [[ "$OLD_WAS_RUNNING" == true ]]; then
+            docker start "$CONTAINER" >/dev/null 2>&1 || true
+        fi
+        die "$(msg "无法重命名旧容器，已尝试恢复原状态。" \
+                    "Could not rename old container; attempted to restore its original state.")"
     fi
 
     ok "$(msg "旧容器已保留。" "Previous container preserved.")"
@@ -532,6 +730,7 @@ backup_existing_container() {
 run_container() {
     local image="${IMAGE_REPO}:${IMAGE_TAG}"
     local -a docker_args
+    local new_json
 
     docker_args=(
         run -d
@@ -561,12 +760,21 @@ run_container() {
     if ! docker "${docker_args[@]}"; then
         return 1
     fi
+    NEW_CONTAINER_CREATED=true
 
     # 备份失败只告警，不回滚：容器已成功启动，不应因备份问题丢弃它。
-    docker inspect "$CONTAINER" \
-        > "$BACKUP_DIR/${CONTAINER}-new-$(date +%Y%m%d-%H%M%S).json" 2>/dev/null ||
+    local stamp
+    local suffix=0
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    new_json="$BACKUP_DIR/${CONTAINER}-new-${stamp}.json"
+    while [[ -e "$new_json" ]]; do
+        suffix=$((suffix + 1))
+        new_json="$BACKUP_DIR/${CONTAINER}-new-${stamp}-${suffix}.json"
+    done
+    if ! save_container_inspect "$CONTAINER" "$new_json"; then
         warn "$(msg "无法保存新容器配置备份，但容器已启动。" \
                      "Could not save the new container configuration backup, but the container is running.")"
+    fi
 }
 
 wait_for_comfyui() {
@@ -576,7 +784,8 @@ wait_for_comfyui() {
                   "Waiting for ComfyUI, up to approximately 180 seconds...")"
 
     for ((attempt=1; attempt<=36; attempt++)); do
-        if curl -fsS --max-time 4 \
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == "true" ]] &&
+           curl -fsS --max-time 4 \
             "http://127.0.0.1:${PORT}/system_stats" >/dev/null 2>&1
         then
             ok "$(msg "ComfyUI HTTP 健康检查通过。" \
@@ -590,35 +799,78 @@ wait_for_comfyui() {
     return 1
 }
 
+# 回滚流程：
+#   1. 删除新容器；若删除失败则中止回滚（否则重命名会与现存容器冲突）。
+#   2. 把旧容器名改回原名。
+#   3. 启动旧容器并轮询验证其确实在运行。
+# 所有分支都返回 0，错误通过 warn 输出；调用方在之后 die，避免 set -e 提前退出。
 rollback_container() {
-    local rollback_ok=1
+    local old_renamed=0
+    local old_running=0
+    local attempt
 
     warn "$(msg "新容器未成功启动或未通过健康检查，正在尝试回滚。" \
                  "New container failed to start or failed health check. Attempting rollback.")"
 
+    # 删除新容器；若删除失败则中止回滚，避免名称冲突。
     if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
         docker logs --tail 120 "$CONTAINER" 2>&1 || true
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || rollback_ok=0
-    fi
 
-    if [[ -n "$OLD_CONTAINER" ]] &&
-       docker container inspect "$OLD_CONTAINER" >/dev/null 2>&1
-    then
-        if docker rename "$OLD_CONTAINER" "$CONTAINER"; then
-            docker start "$CONTAINER" || rollback_ok=0
-        else
-            rollback_ok=0
-            warn "$(msg "无法恢复旧容器名称，请手动检查 docker ps -a。" \
-                         "Could not restore the old container name. Check docker ps -a manually.")"
+        if ! docker rm -f "$CONTAINER" >/dev/null 2>&1; then
+            warn "$(msg "无法删除新容器，自动回滚中止。请手动处理：" \
+                         "Could not remove the new container. Automatic rollback aborted. Handle manually:")"
+            echo "  docker ps -a"
+            echo "  docker logs $CONTAINER"
+            return 0
         fi
     fi
 
-    if (( rollback_ok == 1 )); then
-        ok "$(msg "回滚操作已完成。" "Rollback operation completed.")"
-    else
-        warn "$(msg "自动回滚未能完全完成，请检查容器状态。" \
-                     "Automatic rollback was incomplete. Check container status.")"
+    # 恢复旧容器名称。
+    if [[ -n "$OLD_CONTAINER" ]] && docker container inspect "$OLD_CONTAINER" >/dev/null 2>&1; then
+        if docker rename "$OLD_CONTAINER" "$CONTAINER"; then
+            old_renamed=1
+        else
+            warn "$(msg "无法将备份容器 $OLD_CONTAINER 重命名为 $CONTAINER。" \
+                         "Could not rename backup container $OLD_CONTAINER back to $CONTAINER.")"
+        fi
     fi
+
+    # 只恢复原本正在运行的容器；原本停止的容器继续保持停止。
+    if (( old_renamed == 1 )); then
+        if [[ "$OLD_WAS_RUNNING" == true ]]; then
+            if docker start "$CONTAINER" >/dev/null 2>&1; then
+                for attempt in 1 2 3 4 5; do
+                    if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == "true" ]]; then
+                        old_running=1
+                        break
+                    fi
+                    sleep 2
+                done
+            fi
+        else
+            old_running=1
+        fi
+    fi
+
+    if (( old_running == 1 )) && [[ "$OLD_WAS_RUNNING" == true ]]; then
+        ok "$(msg "回滚完成，旧容器已恢复运行。" \
+                   "Rollback completed; the previous container is running again.")"
+    elif (( old_running == 1 )); then
+        ok "$(msg "回滚完成，旧容器保持原来的停止状态。" \
+                   "Rollback completed; the previous container remains stopped as before.")"
+    elif (( old_renamed == 1 )); then
+        warn "$(msg "旧容器已恢复名称但未能确认运行。请检查：" \
+                     "The previous container was renamed back but could not be confirmed running. Check:")"
+        echo "  docker ps -a"
+        echo "  docker logs $CONTAINER"
+    elif [[ -n "$OLD_CONTAINER" ]]; then
+        warn "$(msg "旧容器保留为 $OLD_CONTAINER，未能自动恢复。请手动处理。" \
+                     "The previous container is preserved as $OLD_CONTAINER and was not restored automatically. Handle manually.")"
+    else
+        ok "$(msg "没有旧容器需要恢复。" "No previous container needed restoration.")"
+    fi
+
+    return 0
 }
 
 show_result() {
@@ -669,12 +921,17 @@ main() {
 
     choose_data_directory
     check_docker
+    check_data_docker_path_conflict
+    validate_data_path "$DATA_DIR"
     choose_image
     choose_access_mode
 
     prepare_data_directories
-    pull_image
+
+    # 先检查 Docker 存储空间，再进行可能拉取测试镜像的 GPU 透传测试。
+    check_docker_space
     check_nvidia_docker
+    pull_image
 
     backup_existing_container
 
@@ -694,8 +951,3 @@ main() {
 }
 
 main "$@"
-'''
-
-path = Path("/mnt/data/install.sh")
-path.write_text(script, encoding="utf-8")
-print(f"已生成：{path}（{len(script.splitlines())} 行）")
